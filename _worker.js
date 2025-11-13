@@ -41,12 +41,12 @@ class LRUCache {
   }
 }
 
-const userInfoCache = new LRUCache(1000);      // key: real chatId
-const topicIdCache = new LRUCache(1000);       // key: real chatId
+const userInfoCache = new LRUCache(1000);      // key: 真实 chatId
+const topicIdCache = new LRUCache(1000);       // key: 真实 chatId
 const userStateCache = new LRUCache(1000);     // key: userKey = `${botIndex}:${chatId}`
 const messageRateCache = new LRUCache(1000);   // key: userKey
 
-// 生成 userKey：同一个用户在不同 bot 上有不同的状态
+// 为某个 bot 上的某个用户生成唯一 key：验证、黑名单、限流都按 bot 维度独立
 function makeUserKey(botIndex, chatId) {
   return `${botIndex}:${chatId}`;
 }
@@ -57,7 +57,7 @@ function tgApiUrl(botToken, method) {
 
 export default {
   async fetch(request, env) {
-    // 多个 bot token: BOT_TOKEN_ENV = "token1,token2,token3"
+    // 多 bot：BOT_TOKEN_ENV = "token1,token2,token3"
     const botTokenEnv = env.BOT_TOKEN_ENV || '';
     BOT_TOKENS = botTokenEnv
       .split(',')
@@ -86,7 +86,7 @@ export default {
       const url = new URL(request.url);
 
       if (url.pathname === '/webhook') {
-        // 解析当前是第几个 bot
+        // 当前是第几个 bot
         let botIndex = 0;
         const botParam = url.searchParams.get('bot');
         if (botParam !== null) {
@@ -265,8 +265,9 @@ export default {
           .bind('user_raw_enabled', 'true').run()
       ]);
 
-      settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
-      settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
+      // 这里直接缓存字符串 'true' / 'false'
+      settingsCache.set('verification_enabled', await getSetting('verification_enabled', d1));
+      settingsCache.set('user_raw_enabled', await getSetting('user_raw_enabled', d1));
     }
 
     async function createTable(d1, tableName, structure) {
@@ -321,11 +322,11 @@ export default {
 
     async function onMessage(message, botIndex, botToken, env) {
       const chatId = message.chat.id.toString();      // 真实用户 chatId 或群聊 id
-      const userKey = makeUserKey(botIndex, chatId);  // 用于存状态 / 限流 / 黑名单
+      const userKey = makeUserKey(botIndex, chatId);  // userKey：用于状态 / 限流 / 黑名单
       const text = message.text || '';
       const messageId = message.message_id;
 
-      // 群里的消息
+      // 群消息（客服群）
       if (chatId === GROUP_ID.toString()) {
         const topicId = message.message_thread_id;
         if (topicId) {
@@ -345,7 +346,7 @@ export default {
         return;
       }
 
-      // 私聊里的消息：按 bot 独立 userKey 管理
+      // 私聊消息：按 userKey 管理
       let userState = userStateCache.get(userKey);
       if (userState === undefined) {
         userState = await env.D1.prepare(
@@ -569,7 +570,14 @@ export default {
         const newLock = (async () => {
           const userName = userInfo.username || `User_${chatId}`;
           const nickname = userInfo.nickname || userName;
-          const newTopicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId, env, botToken);
+          const newTopicId = await createForumTopic(
+            nickname,
+            userName,
+            nickname,
+            userInfo.id || chatId,
+            env,
+            botToken
+          );
           await saveTopicId(chatId, newTopicId, env);
           return newTopicId;
         })();
@@ -585,8 +593,7 @@ export default {
 
     async function handleResetUser(chatId, topicId, text, botIndex, env) {
       const senderId = chatId;
-      // 管理员权限检查：任意 bot 的管理员即可
-      // 这里用第一个 bot 的 token 来查权限
+      // 用第一个 bot 检查管理员权限
       const isAdmin = await checkIfAdmin(senderId, BOT_TOKENS[0]);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此功能。', BOT_TOKENS[0]);
@@ -767,8 +774,10 @@ export default {
       await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
         .bind(key, value)
         .run();
+
       if (key === 'verification_enabled') {
-        settingsCache.set('verification_enabled', value === 'true');
+        // 这里直接存字符串 'true' / 'false'
+        settingsCache.set('verification_enabled', value);
         if (value === 'false') {
           const nowSeconds = Math.floor(Date.now() / 1000);
           const verifiedExpiry = nowSeconds + 3600 * 24;
@@ -778,7 +787,7 @@ export default {
           userStateCache.clear();
         }
       } else if (key === 'user_raw_enabled') {
-        settingsCache.set('user_raw_enabled', value === 'true');
+        settingsCache.set('user_raw_enabled', value);
       }
     }
 
@@ -822,7 +831,6 @@ export default {
       if (action === 'verify') {
         const [, userChatId, selectedAnswer, result] = data.split('_');
         if (userChatId !== chatId) {
-          // 只处理自己这条验证
           await answerCallback(callbackQuery.id, botToken);
           return;
         }
@@ -931,7 +939,7 @@ export default {
         return;
       }
 
-      // 下面是管理员相关操作
+      // 管理员相关操作
       const senderId = callbackQuery.from.id.toString();
       const isAdmin = await checkIfAdmin(senderId, botToken);
       if (!isAdmin) {
@@ -1390,7 +1398,7 @@ export default {
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
     }
 
-    // 手动重新注册所有 bot 的 webhook
+    // 手动注册所有 bot 的 webhook
     async function registerWebhook(request) {
       const origin = new URL(request.url).origin;
       const results = [];
