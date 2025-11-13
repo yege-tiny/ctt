@@ -12,8 +12,7 @@ const processedCallbacks = new Set();
 const topicCreationLocks = new Map();
 
 const settingsCache = new Map([
-  ['verification_enabled', null],
-  ['user_raw_enabled', null]
+  ['verification_enabled', null]
 ]);
 
 class LRUCache {
@@ -212,7 +211,8 @@ export default {
         chat_topic_mappings: {
           columns: {
             chat_id: 'TEXT PRIMARY KEY', // 存真实 chatId
-            topic_id: 'TEXT NOT NULL'
+            topic_id: 'TEXT NOT NULL',
+            bot_index: 'INTEGER DEFAULT 0' // 负责这个话题的 bot 下标
           }
         },
         settings: {
@@ -258,16 +258,11 @@ export default {
         }
       }
 
-      await Promise.all([
-        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('verification_enabled', 'true').run(),
-        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('user_raw_enabled', 'true').run()
-      ]);
+      await d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+        .bind('verification_enabled', 'true').run();
 
-      // 这里直接缓存字符串 'true' / 'false'
+      // 缓存 verification_enabled
       settingsCache.set('verification_enabled', await getSetting('verification_enabled', d1));
-      settingsCache.set('user_raw_enabled', await getSetting('user_raw_enabled', d1));
     }
 
     async function createTable(d1, tableName, structure) {
@@ -330,13 +325,21 @@ export default {
       if (chatId === GROUP_ID.toString()) {
         const topicId = message.message_thread_id;
         if (topicId) {
-          const privateChatId = await getPrivateChatId(topicId, env);
+          // 获取这个话题的归属 bot
+          const mapping = await getTopicMappingByTopicId(topicId, env);
+          if (!mapping) return;
+          const privateChatId = mapping.chatId;
+          const ownerBotIndex = mapping.botIndex ?? 0;
+
+          // 不是负责这个话题的 bot → 忽略
+          if (ownerBotIndex !== botIndex) return;
+
           if (privateChatId && text === '/admin') {
-            await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env, botIndex);
+            await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env);
             return;
           }
           if (privateChatId && text.startsWith('/reset_user')) {
-            await handleResetUser(chatId, topicId, text, botIndex, env);
+            await handleResetUser(chatId, topicId, text, botIndex, env, botToken);
             return;
           }
           if (privateChatId) {
@@ -483,7 +486,7 @@ export default {
           botToken
         );
         const userInfo = await getUserInfo(chatId, botToken);
-        await ensureUserTopic(chatId, userInfo, env, botToken);
+        await ensureUserTopic(chatId, userInfo, env, botToken, botIndex);
         return;
       }
 
@@ -493,7 +496,7 @@ export default {
         return;
       }
 
-      let topicId = await ensureUserTopic(chatId, userInfo, env, botToken);
+      let topicId = await ensureUserTopic(chatId, userInfo, env, botToken, botIndex);
       if (!topicId) {
         await sendMessageToUser(chatId, '无法创建话题，请稍后再试或联系管理员。', botToken);
         return;
@@ -506,7 +509,7 @@ export default {
           .run();
         topicIdCache.set(chatId, undefined);
 
-        topicId = await ensureUserTopic(chatId, userInfo, env, botToken);
+        topicId = await ensureUserTopic(chatId, userInfo, env, botToken, botIndex);
         if (!topicId) {
           await sendMessageToUser(chatId, '无法重新创建话题，请稍后再试或联系管理员。', botToken);
           return;
@@ -554,7 +557,7 @@ export default {
       }
     }
 
-    async function ensureUserTopic(chatId, userInfo, env, botToken) {
+    async function ensureUserTopic(chatId, userInfo, env, botToken, botIndex) {
       let lock = topicCreationLocks.get(chatId);
       if (!lock) {
         lock = Promise.resolve();
@@ -578,7 +581,7 @@ export default {
             env,
             botToken
           );
-          await saveTopicId(chatId, newTopicId, env);
+          await saveTopicId(chatId, newTopicId, env, botIndex);
           return newTopicId;
         })();
 
@@ -591,18 +594,17 @@ export default {
       }
     }
 
-    async function handleResetUser(chatId, topicId, text, botIndex, env) {
+    async function handleResetUser(chatId, topicId, text, botIndex, env, botToken) {
       const senderId = chatId;
-      // 用第一个 bot 检查管理员权限
-      const isAdmin = await checkIfAdmin(senderId, BOT_TOKENS[0]);
+      const isAdmin = await checkIfAdmin(senderId, botToken);
       if (!isAdmin) {
-        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。', BOT_TOKENS[0]);
+        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。', botToken);
         return;
       }
 
       const parts = text.split(' ');
       if (parts.length !== 2) {
-        await sendMessageToTopic(topicId, '用法：/reset_user <chat_id>', BOT_TOKENS[0]);
+        await sendMessageToTopic(topicId, '用法：/reset_user <chat_id>', botToken);
         return;
       }
 
@@ -622,13 +624,12 @@ export default {
       await sendMessageToTopic(
         topicId,
         `用户 ${targetChatId} 在当前 bot 的状态已重置（话题也已重置）。`,
-        BOT_TOKENS[0]
+        botToken
       );
     }
 
-    async function sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env, botIndex) {
+    async function sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env) {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
 
       const buttons = [
         [
@@ -641,12 +642,6 @@ export default {
             callback_data: `toggle_verification_${privateChatId}`
           },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
-        ],
-        [
-          {
-            text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw',
-            callback_data: `toggle_user_raw_${privateChatId}`
-          }
         ],
         [{ text: '删除用户', callback_data: `delete_user_${privateChatId}` }]
       ];
@@ -675,11 +670,7 @@ export default {
     }
 
     async function getVerificationSuccessMessage(env) {
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
       const defaultMsg = '验证成功！您现在可以与我聊天。';
-
-      if (!userRawEnabled) return defaultMsg;
-
       const customMsg = env.VERIFICATION_SUCCESS_MESSAGE || '';
       const text = (customMsg && customMsg.trim()) || defaultMsg;
       return text;
@@ -776,7 +767,6 @@ export default {
         .run();
 
       if (key === 'verification_enabled') {
-        // 这里直接存字符串 'true' / 'false'
         settingsCache.set('verification_enabled', value);
         if (value === 'false') {
           const nowSeconds = Math.floor(Date.now() / 1000);
@@ -786,8 +776,6 @@ export default {
           ).bind(true, verifiedExpiry, false, false).run();
           userStateCache.clear();
         }
-      } else if (key === 'user_raw_enabled') {
-        settingsCache.set('user_raw_enabled', value);
       }
     }
 
@@ -808,9 +796,6 @@ export default {
       } else if (data.startsWith('toggle_verification_')) {
         action = 'toggle_verification';
         privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('toggle_user_raw_')) {
-        action = 'toggle_user_raw';
-        privateChatId = parts.slice(3).join('_');
       } else if (data.startsWith('check_blocklist_')) {
         action = 'check_blocklist';
         privateChatId = parts.slice(2).join('_');
@@ -828,6 +813,7 @@ export default {
         privateChatId = '';
       }
 
+      // 1）验证按钮：在用户私聊里，不走话题归属判断
       if (action === 'verify') {
         const [, userChatId, selectedAnswer, result] = data.split('_');
         if (userChatId !== chatId) {
@@ -920,7 +906,7 @@ export default {
             botToken
           );
           const userInfo = await getUserInfo(chatId, botToken);
-          await ensureUserTopic(chatId, userInfo, env, botToken);
+          await ensureUserTopic(chatId, userInfo, env, botToken, botIndex);
         } else {
           await sendMessageToUser(chatId, '验证失败，请重新尝试。', botToken);
           await handleVerification(chatId, userKey, messageId, botToken, env);
@@ -939,12 +925,27 @@ export default {
         return;
       }
 
+      // 2）管理员按钮（在群话题里）：只让负责这个话题的 bot 处理
+      if (chatId === GROUP_ID.toString() && topicId) {
+        const mapping = await getTopicMappingByTopicId(topicId, env);
+        if (!mapping) {
+          await answerCallback(callbackQuery.id, botToken);
+          return;
+        }
+        const ownerBotIndex = mapping.botIndex ?? 0;
+        if (ownerBotIndex !== botIndex) {
+          // 不是负责这个话题的 bot，忽略
+          await answerCallback(callbackQuery.id, botToken);
+          return;
+        }
+      }
+
       // 管理员相关操作
       const senderId = callbackQuery.from.id.toString();
       const isAdmin = await checkIfAdmin(senderId, botToken);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此功能。', botToken);
-        await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env, botIndex);
+        await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env);
         await answerCallback(callbackQuery.id, botToken);
         return;
       }
@@ -1005,15 +1006,6 @@ export default {
           `黑名单列表（当前 bot）：\n${blockList}`,
           botToken
         );
-      } else if (action === 'toggle_user_raw') {
-        const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-        const newState = !currentState;
-        await setSetting('user_raw_enabled', newState.toString(), env);
-        await sendMessageToTopic(
-          topicId,
-          `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`,
-          botToken
-        );
       } else if (action === 'delete_user') {
         userStateCache.set(targetUserKey, undefined);
         messageRateCache.set(targetUserKey, undefined);
@@ -1032,7 +1024,7 @@ export default {
         await sendMessageToTopic(topicId, `未知操作：${action}`, botToken);
       }
 
-      await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env, botIndex);
+      await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env);
       await answerCallback(callbackQuery.id, botToken);
     }
 
@@ -1247,6 +1239,18 @@ export default {
       return topicId;
     }
 
+    // 根据 topicId 查这个话题对应的用户 & 归属 bot
+    async function getTopicMappingByTopicId(topicId, env) {
+      const result = await env.D1.prepare(
+        'SELECT chat_id, bot_index FROM chat_topic_mappings WHERE topic_id = ?'
+      ).bind(topicId).first();
+      if (!result) return null;
+      return {
+        chatId: result.chat_id,
+        botIndex: result.bot_index ?? 0
+      };
+    }
+
     async function createForumTopic(topicName, userName, nickname, userId, env, botToken) {
       const response = await fetchWithRetry(tgApiUrl(botToken, 'createForumTopic'), {
         method: 'POST',
@@ -1268,21 +1272,11 @@ export default {
       return topicId;
     }
 
-    async function saveTopicId(chatId, topicId, env) {
+    async function saveTopicId(chatId, topicId, env, botIndex) {
       await env.D1.prepare(
-        'INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)'
-      ).bind(chatId, topicId).run();
+        'INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id, bot_index) VALUES (?, ?, ?)'
+      ).bind(chatId, topicId, botIndex).run();
       topicIdCache.set(chatId, topicId);
-    }
-
-    async function getPrivateChatId(topicId, env) {
-      for (const [chatId, tid] of topicIdCache.cache) {
-        if (tid === topicId) return chatId;
-      }
-      const mapping = await env.D1.prepare(
-        'SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?'
-      ).bind(topicId).first();
-      return mapping?.chat_id || null;
     }
 
     async function sendMessageToTopic(topicId, text, botToken) {
