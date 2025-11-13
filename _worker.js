@@ -945,7 +945,7 @@ export default {
       const isAdmin = await checkIfAdmin(senderId, botToken);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此功能。', botToken);
-        await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env);
+        // ❌ 不再重新弹出管理面板
         await answerCallback(callbackQuery.id, botToken);
         return;
       }
@@ -1024,7 +1024,7 @@ export default {
         await sendMessageToTopic(topicId, `未知操作：${action}`, botToken);
       }
 
-      await sendAdminPanel(chatId, topicId, privateChatId, messageId, botToken, env);
+      // ✅ 操作完成后，只结束回调，不再重新发一次管理员面板
       await answerCallback(callbackQuery.id, botToken);
     }
 
