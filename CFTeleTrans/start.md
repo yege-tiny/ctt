@@ -1,4 +1,2 @@
-本机器人项目地址：  
-[GitHub 项目](https://github.com/iawooo/ctt)  
-
+验证成功！您现在可以与我聊天。
 欢迎 fork，留下你的 star 再走吧！
