@@ -11,9 +11,7 @@ const processedCallbacks = new Set();
 
 const topicCreationLocks = new Map();
 
-const settingsCache = new Map([
-  ['verification_enabled', null]
-]);
+const settingsCache = new Map([['verification_enabled', null]]);
 
 class LRUCache {
   constructor(maxSize) {
@@ -784,7 +782,6 @@ export default {
       const topicId = callbackQuery.message.message_thread_id;
       const data = callbackQuery.data;
       const messageId = callbackQuery.message.message_id;
-      const userKey = makeUserKey(botIndex, chatId);
 
       const parts = data.split('_');
       let action;
@@ -813,13 +810,15 @@ export default {
         privateChatId = '';
       }
 
-      // 1）验证按钮：在用户私聊里，不走话题归属判断
+      // 1）验证码按钮
       if (action === 'verify') {
         const [, userChatId, selectedAnswer, result] = data.split('_');
         if (userChatId !== chatId) {
           await answerCallback(callbackQuery.id, botToken);
           return;
         }
+
+        const userKey = makeUserKey(botIndex, chatId);
 
         let verificationState = userStateCache.get(userKey);
         if (verificationState === undefined) {
@@ -909,7 +908,7 @@ export default {
           await ensureUserTopic(chatId, userInfo, env, botToken, botIndex);
         } else {
           await sendMessageToUser(chatId, '验证失败，请重新尝试。', botToken);
-          await handleVerification(chatId, userKey, messageId, botToken, env);
+          await handleVerification(chatId, makeUserKey(botIndex, chatId), messageId, botToken, env);
         }
 
         await fetchWithRetry(tgApiUrl(botToken, 'deleteMessage'), {
@@ -934,7 +933,6 @@ export default {
         }
         const ownerBotIndex = mapping.botIndex ?? 0;
         if (ownerBotIndex !== botIndex) {
-          // 不是负责这个话题的 bot，忽略
           await answerCallback(callbackQuery.id, botToken);
           return;
         }
@@ -945,11 +943,124 @@ export default {
       const isAdmin = await checkIfAdmin(senderId, botToken);
       if (!isAdmin) {
         await sendMessageToTopic(topicId, '只有管理员可以使用此功能。', botToken);
-        // ❌ 不再重新弹出管理面板
         await answerCallback(callbackQuery.id, botToken);
         return;
       }
 
+      // 先处理“资料卡按钮”：topic_block / topic_unblock / topic_pin
+      if (action === 'topic_block' || action === 'topic_unblock' || action === 'topic_pin') {
+        if (!topicId) {
+          await answerCallback(callbackQuery.id, botToken);
+          return;
+        }
+
+        const mapping = await getTopicMappingByTopicId(topicId, env);
+        if (!mapping) {
+          await sendMessageToTopic(topicId, '未找到该话题对应的用户映射。', botToken);
+          await answerCallback(callbackQuery.id, botToken);
+          return;
+        }
+
+        const targetChatId = mapping.chatId;
+        const targetUserKey = makeUserKey(botIndex, targetChatId);
+
+        if (action === 'topic_pin') {
+          // 置顶当前资料卡消息
+          try {
+            await pinMessage(topicId, messageId, botToken);
+            await fetchWithRetry(tgApiUrl(botToken, 'answerCallbackQuery'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                callback_query_id: callbackQuery.id,
+                text: '📌 资料卡已置顶',
+                show_alert: false
+              })
+            });
+          } catch (e) {
+            await fetchWithRetry(tgApiUrl(botToken, 'answerCallbackQuery'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                callback_query_id: callbackQuery.id,
+                text: `❌ 置顶失败：${e.message}`,
+                show_alert: true
+              })
+            });
+          }
+          return;
+        }
+
+        // topic_block / topic_unblock：更新 is_blocked 并刷新按钮文案
+        let state = userStateCache.get(targetUserKey);
+        if (state === undefined) {
+          state = await env.D1.prepare(
+            'SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?'
+          ).bind(targetUserKey).first() || { is_blocked: false, is_first_verification: true };
+        }
+
+        const markup = callbackQuery.message.reply_markup || { inline_keyboard: [] };
+        const kb = markup.inline_keyboard || [];
+        if (!kb[0]) kb[0] = [];
+
+        if (action === 'topic_block') {
+          state.is_blocked = true;
+          userStateCache.set(targetUserKey, state);
+          await env.D1.prepare(
+            'INSERT OR REPLACE INTO user_states (chat_id, is_blocked) VALUES (?, ?)'
+          ).bind(targetUserKey, true).run();
+
+          kb[0][0] = { text: '✅ 解除屏蔽', callback_data: 'topic_unblock' };
+          markup.inline_keyboard = kb;
+
+          await fetchWithRetry(tgApiUrl(botToken, 'editMessageReplyMarkup'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId,
+              reply_markup: markup
+            })
+          });
+
+          await sendMessageToTopic(
+            topicId,
+            `用户 ${targetChatId} 已在当前 bot 被拉黑，消息将不再转发。`,
+            botToken
+          );
+        } else if (action === 'topic_unblock') {
+          state.is_blocked = false;
+          state.is_first_verification = true;
+          userStateCache.set(targetUserKey, state);
+          await env.D1.prepare(
+            'INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)'
+          ).bind(targetUserKey, false, true).run();
+
+          kb[0][0] = { text: '🚫 屏蔽此人', callback_data: 'topic_block' };
+          markup.inline_keyboard = kb;
+
+          await fetchWithRetry(tgApiUrl(botToken, 'editMessageReplyMarkup'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId,
+              reply_markup: markup
+            })
+          });
+
+          await sendMessageToTopic(
+            topicId,
+            `用户 ${targetChatId} 已在当前 bot 解除拉黑，消息将继续转发。`,
+            botToken
+          );
+        }
+
+        await answerCallback(callbackQuery.id, botToken);
+        return;
+      }
+
+      // 其余管理员操作：/admin 面板里的 block/unblock/删除/开关验证等
       const targetChatId = privateChatId;
       const targetUserKey = makeUserKey(botIndex, targetChatId);
 
@@ -1265,8 +1376,30 @@ export default {
       const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
       const notificationContent = await getNotificationContent(env);
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-      const messageResponse = await sendMessageToTopic(topicId, pinnedMessage, botToken);
-      const messageId = messageResponse.result.message_id;
+
+      // 在资料卡上挂内联按钮：屏蔽/解禁 + 置顶
+      const buttons = [
+        [
+          { text: '🚫 屏蔽此人', callback_data: 'topic_block' },
+          { text: '📌 置顶资料卡', callback_data: 'topic_pin' }
+        ]
+      ];
+
+      const msgResp = await fetchWithRetry(tgApiUrl(botToken, 'sendMessage'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: GROUP_ID,
+          text: pinnedMessage,
+          message_thread_id: topicId,
+          reply_markup: { inline_keyboard: buttons }
+        })
+      });
+      const msgData = await msgResp.json();
+      if (!msgData.ok) {
+        throw new Error(`Failed to send pinned card: ${msgData.description}`);
+      }
+      const messageId = msgData.result.message_id;
       await pinMessage(topicId, messageId, botToken);
 
       return topicId;
